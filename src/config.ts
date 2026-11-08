@@ -73,4 +73,22 @@ export const config = {
   /** Teto de documentos e de bytes totais por chamada de `baixar_inteiro_teor`. */
   maxBatchDocuments: parsePositiveInt(process.env.PJE_MAX_BATCH_DOCUMENTS, 1000),
   maxBatchBytes: parsePositiveInt(process.env.PJE_MAX_BATCH_BYTES, 2 * 1024 * 1024 * 1024),
+  /**
+   * Prazo total (cabeçalho + corpo) de cada tentativa de download. O PJe entrega ~200 KB/s: 600 s
+   * cobrem o teto de 100 MB por documento (um vídeo de 58 MB levou 313 s numa medição real).
+   */
+  downloadTimeoutMs: parsePositiveInt(process.env.PJE_DOWNLOAD_TIMEOUT_MS, 600_000),
+  /** Documentos baixados ao mesmo tempo, dentro de uma coleta de `baixar_inteiro_teor` (1 = sequencial). */
+  downloadConcurrency: parsePositiveInt(process.env.PJE_DOWNLOAD_CONCURRENCY, 3),
 };
+
+/**
+ * Arquivo de sessão de cada grau. O 1º grau usa `storageStatePath` como está; o 2º usa o mesmo caminho
+ * com `-2g` antes da extensão. Os graus têm SSO e perfil próprios: com um arquivo só, autenticar um
+ * sobrescreveria o outro.
+ */
+export function storageStatePathFor(grau: "1" | "2"): string {
+  if (grau === "1") return config.storageStatePath;
+  const { dir, name, ext } = path.parse(config.storageStatePath);
+  return path.join(dir, `${name}-2g${ext}`);
+}

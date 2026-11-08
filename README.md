@@ -105,10 +105,12 @@ PJE_MAX_SESSIONS=2
 PJE_MAX_DOCUMENT_BYTES=104857600
 PJE_MAX_BATCH_DOCUMENTS=1000
 PJE_MAX_BATCH_BYTES=2147483648
+PJE_DOWNLOAD_TIMEOUT_MS=600000
+PJE_DOWNLOAD_CONCURRENCY=3
 LOG_LEVEL=info
 ```
 
-Limites de recursos: `PJE_MAX_SESSIONS` é o número de Chromiums simultâneos (as demais chamadas esperam na fila); `PJE_MAX_DOCUMENT_BYTES` é o teto por documento; `PJE_MAX_BATCH_DOCUMENTS` e `PJE_MAX_BATCH_BYTES` limitam uma coleta de `baixar_inteiro_teor` (acima de documentos, a chamada falha antes de baixar; acima de bytes, os restantes entram no manifesto como erro).
+Limites de recursos: `PJE_MAX_SESSIONS` é o número de Chromiums simultâneos (as demais chamadas esperam na fila); `PJE_MAX_DOCUMENT_BYTES` é o teto por documento; `PJE_MAX_BATCH_DOCUMENTS` e `PJE_MAX_BATCH_BYTES` limitam uma coleta de `baixar_inteiro_teor` (acima de documentos, a chamada falha antes de baixar; acima de bytes, os restantes entram no manifesto como erro). `PJE_DOWNLOAD_CONCURRENCY` (padrão 3; `1` = sequencial) é quantos documentos de uma coleta baixam ao mesmo tempo, o que torna a coleta 2 a 4 vezes mais rápida; com ele o teto de bytes é aproximado, podendo passar por até (concorrência − 1) documentos já em andamento. `PJE_DOWNLOAD_TIMEOUT_MS` (padrão 600000) é o prazo total de cada tentativa de download: o PJe entrega ~200 KB/s, e um vídeo de 58 MB levou ~313 s. Estouro de prazo é retentado uma vez; falha rápida de rede, até 3.
 
 O `.env` é lido **somente da raiz do pacote** (nunca do diretório atual) e apenas essas chaves são aceitas; variáveis do ambiente do processo (por exemplo, o bloco `env` do cliente MCP) têm precedência. O sandbox do Chromium fica ligado; use `PJE_CHROMIUM_SANDBOX=false` apenas em containers que o exijam.
 
@@ -149,16 +151,36 @@ cross-origin e não é usada por nenhuma das tools.
 
 O fluxo implementado (`src/pje/autos.ts`) é:
 
-1. `GET <baseUrl>/seam/resource/rest/pje-legacy/processo/<numeroCnj>/enderecoAutos` devolve, em texto puro, a URL
-   dos autos digitais já com o `idProcesso` interno e o token de navegação `ca`. É o mesmo endpoint que a caixa
-   "Acesso rápido" do menu lateral do PJe chama ao pressionar Enter, então basta o cookie de sessão — não é
-   preciso reproduzir o popup de busca rápida.
+1. **Pesquisa rápida (1º e 2º graus).** Abre-se o painel (`/ng2/dev.seam`) e chama-se a função global
+   `pesquisaRapida(<número só com dígitos>)`, a mesma da caixa "Acesso rápido". Ela abre um popup que redireciona
+   para `listAutosDigitais.seam?idProcesso=…&ca=…`; é essa a página usada pelas tools. Se o processo não existe ou
+   não é visível ao **perfil ativo da sessão**, o PJe dá `alert("Processo não encontrado")` e fecha o popup — isso
+   vira `PROCESS_NOT_FOUND` (definitivo, sem fallback). No 2º grau esse é o único caminho: lá a caixa não chama
+   `enderecoAutos`.
+   - **Fallback do 1º grau:** se a pesquisa rápida falhar por mudança de interface (`PJE_INTERFACE_CHANGED`), usa-se
+     `GET <baseUrl>/seam/resource/rest/pje-legacy/processo/<numeroCnj>/enderecoAutos`, que devolve em texto puro a URL
+     dos autos já com `idProcesso` e `ca`. Esse endpoint responde `204` de forma intermitente, o que o tornava
+     pouco confiável como caminho primário.
 2. Navegação para essa URL e leitura do cabeçalho (`#maisDetalhes`, `#poloAtivo`, `#poloPassivo`) e da timeline
    (`#divTimeLine`). A timeline usa rolagem infinita: as páginas restantes são carregadas via `novaPagina()` até
    `#paginaAtual` alcançar `#totalPaginas`.
 3. Download por HTTP direto em `<baseUrl>/seam/resource/rest/pje-legacy/documento/download/<idProcessoDocumento>`
    (a mesma URL que o visualizador do PJe usa como `src` do iframe), com fallback para a variante
-   `.../download/<TRIBUNAL>/<grau>g/<idProcesso>/<id>` usada pelo botão "abrir em outra aba".
+   `.../download/<TRIBUNAL>/<grau>g/<idProcesso>/<id>` usada pelo botão "abrir em outra aba". **No 2º grau a forma
+   curta responde 404 e só a longa atende**; por isso `baixar_documento` abre os autos para obter o `idProcesso`
+   quando a curta falha.
+
+### Perfis e sessões
+
+O perfil (papel + localização) é escolhido no login e fica preso à sessão no servidor; ele decide quais processos a
+sessão enxerga. `status_autenticacao` devolve `perfilAtivo` (papel, cargo e ids de órgão/localização; nunca nome ou
+login), e o `PROCESS_NOT_FOUND` traz o mesmo dado em `details`. Para trocar de perfil é preciso refazer a
+autenticação. Cada grau tem o seu `storageState`: o 1º grau grava em `PJE_STORAGE_STATE_PATH` (padrão
+`storage-state.json`) e o 2º no mesmo caminho com `-2g` antes da extensão (`storage-state-2g.json`). Assim
+`npm run auth` e `npm run auth -- 2` não se sobrescrevem e os dois graus ficam autenticados ao mesmo tempo. Quem
+atua com mais de um perfil no mesmo grau ainda precisa de um `PJE_STORAGE_STATE_PATH` por perfil (uma instância do
+servidor para cada). Se a verificação da sessão falhar por rede ou lentidão, o erro é `TIMEOUT`, não
+`SESSION_EXPIRED`.
 
 ### Armadilhas confirmadas contra o PJe real
 
@@ -320,6 +342,48 @@ LOG_LEVEL = "error"
 ```
 
 Com `cwd = "."`, valores relativos como `PJE_DOWNLOAD_DIR = "Sandbox"` são resolvidos a partir da raiz do projeto que contém `.codex/config.toml`. Isso evita `PATH_TRAVERSAL` ao baixar para uma pasta de trabalho local. Se usar configuração por projeto, remova a seção global `[mcp_servers.pje-trf1]` de `~/.codex/config.toml` para evitar duplicidade.
+
+## Claude Code e Claude Desktop
+
+O servidor fala MCP por stdio, então qualquer cliente que execute `node dist/server.js` (ou o `npx` equivalente) serve. O login é sempre manual e fora do cliente: rode `npm run auth` (1º grau) ou `npm run auth -- 2` (2º grau) no terminal antes de usar as tools.
+
+### Claude Code (CLI e aba Code do app)
+
+Para clone local, com o caminho absoluto do `dist/server.js` (rode `npm run build` antes e depois de qualquer alteração no código):
+
+```bash
+claude mcp add pje-trf1 --scope user -- node <caminho-do-clone>/dist/server.js
+```
+
+Para instalação direta do GitHub (fixe o commit, como na seção "Direto do GitHub"):
+
+```bash
+claude mcp add pje-trf1 --scope user -- npx -y -p github:naiberpontes/trf1-pje-mcp-bridge#<commit-sha> mcp-pje-trf1
+```
+
+`--scope user` vale para todos os projetos; `--scope project` grava num `.mcp.json` na raiz do projeto. `claude mcp list` mostra os servidores registrados. Abra uma sessão nova: as tools aparecem como `mcp__pje-trf1__consultar_processo`, `mcp__pje-trf1__listar_documentos` etc.
+
+### Claude Desktop (chat)
+
+Adicione a chave `mcpServers` ao `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\claude_desktop_config.json`), preservando o restante do arquivo:
+
+```json
+{
+  "mcpServers": {
+    "pje-trf1": {
+      "command": "node",
+      "args": ["<caminho-do-clone>/dist/server.js"]
+    }
+  }
+}
+```
+
+Use barras normais (`/`) no caminho, que dispensam o escape do JSON. **Feche o Claude Desktop por completo (inclusive o ícone da bandeja) antes de editar**: o app regrava esse arquivo ao fechar e pode descartar a alteração se ela for feita com ele aberto. Depois abra o app de novo. Verificado no Windows em 07/11/2026.
+
+### Observações
+
+- Use um nome próprio (`pje-trf1`). Se você já tem outro servidor chamado `pje`, o mesmo nome faria um sobrescrever o outro.
+- Em caso de lentidão ou erro na inicialização no Windows, prefira o caminho absoluto do `node` e a instalação por clone local em vez de `npx`.
 
 ## Práticas Iniciais Recomendadas
 
